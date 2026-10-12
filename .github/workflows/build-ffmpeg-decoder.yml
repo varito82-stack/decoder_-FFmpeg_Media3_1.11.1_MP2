@@ -1,0 +1,109 @@
+# Compila el módulo oficial decoder_ffmpeg de Media3 (Apache 2.0, FFmpeg LGPL)
+# con el decoder MP2 incluido y deja un .aar para descargar.
+#
+# Uso: guardar como .github/workflows/build-ffmpeg-decoder.yml en un repositorio
+# de GitHub y lanzarlo desde la pestaña Actions -> "Run workflow".
+# Basado en el README oficial de libraries/decoder_ffmpeg. No se ha ejecutado
+# todavía: si algún paso falla, copia el log de ese paso para ajustarlo.
+
+name: Compilar decoder FFmpeg para Media3 1.11.1 (con MP2)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      MEDIA3_TAG: "1.11.1"          # misma versión que usa FlowIPTV
+      NDK_VERSION: "26.1.10909125"  # NDK r26b, la que prueba el README oficial
+      ANDROID_ABI: "24"             # igual que el minSdk de FlowIPTV
+      ENABLED_DECODERS: "mp2 mp3 aac ac3 eac3"
+
+    steps:
+      - name: Clonar Media3
+        uses: actions/checkout@v4
+        with:
+          repository: androidx/media
+          ref: ${{ env.MEDIA3_TAG }}
+
+      - name: Instalar JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Instalar NDK r26b y CMake
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "ndk;${NDK_VERSION}" "cmake;3.22.1"
+
+      - name: Mapear audio/mpeg-L2 al decoder mp2 de FFmpeg
+        run: |
+          python3 - <<'EOF'
+          import pathlib, sys
+          p = pathlib.Path("libraries/decoder_ffmpeg/src/main/java/androidx/media3/decoder/ffmpeg/FfmpegLibrary.java")
+          s = p.read_text()
+          print("--- ANTES ---")
+          for l in s.splitlines():
+              if "AUDIO_MPEG" in l or "return \"mp" in l:
+                  print(l)
+          # Quitar L2 de cualquier grupo previo (por si ya estaba mapeado a mp3)
+          lines = [l for l in s.splitlines(keepends=True)
+                   if l.strip() != "case MimeTypes.AUDIO_MPEG_L2:"]
+          s = "".join(lines)
+          # Insertar el caso mp2 justo después de abrir el switch de getCodecName
+          i = s.find("getCodecName")
+          j = s.find("switch (", i)
+          if i < 0 or j < 0:
+              sys.exit("No encuentro el switch de getCodecName; pega aquí el contenido de FfmpegLibrary.java")
+          k = s.find("\n", j) + 1
+          s = s[:k] + "      case MimeTypes.AUDIO_MPEG_L2:\n        return \"mp2\";\n" + s[k:]
+          p.write_text(s)
+          print("--- DESPUÉS ---")
+          for l in s.splitlines():
+              if "AUDIO_MPEG" in l or "return \"mp" in l:
+                  print(l)
+          EOF
+
+      - name: Compilar FFmpeg 6.0 para Android (nativo)
+        run: |
+          set -euo pipefail
+          MODULE="$GITHUB_WORKSPACE/libraries/decoder_ffmpeg/src/main"
+          NDK="$ANDROID_HOME/ndk/$NDK_VERSION"
+          cd "$MODULE/jni"
+          git clone https://github.com/FFmpeg/FFmpeg.git ffmpeg --branch=release/6.0 --depth=1
+          bash ./build_ffmpeg.sh "$MODULE" "$NDK" linux-x86_64 "$ANDROID_ABI" $ENABLED_DECODERS
+
+      - name: Generar el AAR con Gradle
+        run: |
+          set -euo pipefail
+          P=$(./gradlew -q projects | grep -o ":[A-Za-z0-9_-]*ffmpeg[A-Za-z0-9_-]*" | head -1 || true)
+          if [ -z "$P" ]; then
+            echo "No encuentro el módulo FFmpeg; lista de módulos:"
+            ./gradlew -q projects
+            exit 1
+          fi
+          echo "Módulo: $P"
+          ./gradlew "${P}:assembleRelease" --no-daemon
+
+      - name: Reunir y comprobar el AAR
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          F=$(find libraries/decoder_ffmpeg -name "*.aar" | head -1)
+          echo "AAR: $F"
+          cp "$F" out/decoder-ffmpeg-release.aar
+          unzip -l out/decoder-ffmpeg-release.aar | grep -E "\.so|classes\.jar"
+          for abi in armeabi-v7a arm64-v8a; do
+            echo "== $abi: decoders presentes =="
+            unzip -p out/decoder-ffmpeg-release.aar "jni/$abi/libffmpegJNI.so" | strings | grep -x -E "mp2|mp3|aac|ac3|eac3" | sort -u || true
+          done
+
+      - name: Subir el AAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: decoder-ffmpeg-aar
+          path: out/decoder-ffmpeg-release.aar
